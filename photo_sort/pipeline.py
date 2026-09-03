@@ -39,6 +39,7 @@ def run_scan(
     as ``cb(done, total, message)`` after every photo. Either, both, or neither.
     """
     cfg = Config.load(config_path)
+    src_list = [{"type": s.type, "roots": list(s.roots)} for s in cfg.sources]
     store = Store(state_dir)
     fp_cache: dict = {} if refresh else store.load_fingerprints()
 
@@ -139,7 +140,12 @@ def run_scan(
 
     groups = group_photos(scanned, phash_threshold=similarity)
     payload = _scan_payload(scanned, groups)
+    payload["sources"] = src_list
     store.save_scan(payload)
+    # a fresh scan is a fresh grouping with fresh keeper suggestions -- drop any
+    # keep/quarantine picks from a previous (or crashed) run so Apply can't act
+    # on a stale grouping. Same policy as `regroup`.
+    store.save_decisions({})
 
     dup_count = sum(len(g["members"]) - 1 for g in payload["groups"])
     reclaim = sum(m["size"] for g in payload["groups"] for m in g["members"][1:])
@@ -150,6 +156,7 @@ def run_scan(
         "removable": dup_count,
         "reclaim_bytes": reclaim,
         "flagged": len(flagged),
+        "sources": src_list,
     }
     if console:
         console.print()
@@ -175,7 +182,7 @@ def run_apply(
     if not to_move:
         if console:
             console.print("Nothing marked for removal.")
-        return {"moved": 0, "total": 0}
+        return {"moved": 0, "total": 0, "targets": _review_targets(config_path)}
 
     if console:
         console.print(f"About to move [bold]{len(to_move)}[/] photos into each source's review area.")
@@ -200,6 +207,9 @@ def run_apply(
 
     total = len(to_move)
     moved = 0
+    moved_keys: list[str] = []   # decisions to retire once acted on
+    used_sources: dict = {}      # source_id -> live source object that received a move
+    review_dirs: set[str] = set()  # local destination folders actually written to
     for i, key in enumerate(to_move, 1):
         p = by_id.get(key)
         if not p:
@@ -219,16 +229,48 @@ def run_apply(
         )
         where = s.quarantine(ref)
         moved += 1
+        moved_keys.append(key)
+        used_sources[p["source_id"]] = s
+        if where and where.startswith("/"):
+            review_dirs.add(str(Path(where).parent))
         if console:
             console.print(f"  moved {p['name']} -> {where}")
         if progress_cb:
             progress_cb(i, total, f"moved {p['name']}")
 
+    if moved_keys:
+        # retire acted-on picks so a second Apply doesn't re-move the same files
+        store.save_decisions({k: v for k, v in decisions.items() if k not in set(moved_keys)})
+
+    targets: list[dict] = []
+    for s in used_sources.values():
+        t = s.review_target()
+        if t and t not in targets:
+            targets.append(t)
+    for d in sorted(review_dirs):
+        targets.append({"kind": "path", "label": "photo-sort review folder", "value": d})
+
     if console:
         console.print(
             f"[bold green]Done.[/] {moved} photos moved. Review them, then delete for good yourself."
         )
-    return {"moved": moved, "total": total}
+        for t in targets:
+            console.print(f"  {t['label']}: {t['value']}")
+    return {"moved": moved, "total": total, "targets": targets}
+
+
+def _review_targets(config_path: str) -> list[dict]:
+    """Best-effort ``review_target()`` for every configured source, for the UI to
+    link to even when nothing was moved this run."""
+    out: list[dict] = []
+    try:
+        for spec in Config.load(config_path).sources:
+            t = build_source(spec).review_target()
+            if t and t not in out:
+                out.append(t)
+    except Exception:  # noqa: BLE001 - a missing link must not fail apply
+        pass
+    return out
 
 
 def regroup(state_dir: Path, similarity: int) -> dict:

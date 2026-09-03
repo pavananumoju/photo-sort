@@ -14,9 +14,13 @@ empty it into Trash yourself.
 from __future__ import annotations
 
 import io
+import json
+import threading
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+
+_API = "https://www.googleapis.com/drive/v3"
 
 from photo_sort.model import PhotoRef
 from photo_sort.sources.base import PhotoSource
@@ -36,36 +40,114 @@ class GoogleDriveSource(PhotoSource):
         self._client_secret = Path(client_secret)
         self._token = Path(token)
         self._svc = None
+        self._creds = None
         self._review_folder_id: str | None = None
-        self._authed_session = None
+        self._auth_lock = threading.Lock()
+        # requests.Session / httplib2.Http / the OpenSSL connection under them are
+        # not thread-safe. The scan runs SCAN_WORKERS threads through thumbnail()
+        # at once, so each thread gets its own AuthorizedSession here.
+        self._local = threading.local()
 
     # ---- auth / service -------------------------------------------------
-    def _service(self):
-        if self._svc is not None:
-            return self._svc
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from googleapiclient.discovery import build
+    def _credentials(self):
+        if self._creds is not None:
+            return self._creds
+        with self._auth_lock:
+            if self._creds is not None:
+                return self._creds
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
 
-        creds = None
-        if self._token.exists():
-            creds = Credentials.from_authorized_user_file(str(self._token), SCOPES)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not self._client_secret.exists():
-                    raise RuntimeError(
-                        f"Missing {self._client_secret}. Create a free 'Desktop app' OAuth client at "
-                        "console.cloud.google.com > APIs & Services > Credentials, download it here, "
-                        "and rerun. Full steps: docs/google-drive-setup.md"
-                    )
-                flow = InstalledAppFlow.from_client_secrets_file(str(self._client_secret), SCOPES)
-                creds = flow.run_local_server(port=0)
-            self._token.write_text(creds.to_json())
-        self._svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+            creds = None
+            if self._token.exists():
+                creds = Credentials.from_authorized_user_file(str(self._token), SCOPES)
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    if not self._client_secret.exists():
+                        raise RuntimeError(
+                            f"Missing {self._client_secret}. Create a free 'Desktop app' OAuth client at "
+                            "console.cloud.google.com > APIs & Services > Credentials, download it here, "
+                            "and rerun. Full steps: docs/google-drive-setup.md"
+                        )
+                    flow = InstalledAppFlow.from_client_secrets_file(str(self._client_secret), SCOPES)
+                    creds = flow.run_local_server(port=0)
+                self._token.write_text(creds.to_json())
+            self._creds = creds
+            return self._creds
+
+    def _service(self):
+        """The googleapiclient discovery client. NOT thread-safe -- only touched
+        on the single listing/quarantine thread, never from the scan pool."""
+        if self._svc is None:
+            creds = self._credentials()  # resolve BEFORE taking _auth_lock (not reentrant)
+            with self._auth_lock:
+                if self._svc is None:
+                    from googleapiclient.discovery import build
+
+                    self._svc = build("drive", "v3", credentials=creds, cache_discovery=False)
         return self._svc
+
+    def _session(self):
+        """One AuthorizedSession per thread, each over its own copy of the
+        credentials so a token refresh in one worker can't corrupt another's."""
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            from google.auth.transport.requests import AuthorizedSession
+            from google.oauth2.credentials import Credentials
+
+            base = self._credentials()
+            try:
+                creds = Credentials.from_authorized_user_info(json.loads(base.to_json()), SCOPES)
+            except Exception:  # noqa: BLE001 - service-account / unusual creds: share as-is
+                creds = base
+            sess = AuthorizedSession(creds)
+            self._local.session = sess
+        return sess
+
+    def close(self) -> None:
+        sess = getattr(self._local, "session", None)
+        if sess is not None:
+            sess.close()
+            self._local.session = None
+
+    def is_authed(self) -> bool:
+        """True if a login token is already cached (no browser needed to browse)."""
+        return self._token.exists()
+
+    def has_client_secret(self) -> bool:
+        return self._client_secret.exists()
+
+    # ---- folder browsing (web UI) -----------------------------------
+    def list_child_folders(self, parent_id: str | None = None) -> list[dict]:
+        """Sub-folders of ``parent_id`` (``None`` / "root" == My Drive top level).
+
+        Returns ``[{"id", "name"}]`` sorted by name. Used by the UI folder picker.
+        """
+        sess = self._session()
+        parent = parent_id or "root"
+        params = {
+            "q": (
+                "mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+                f"and {_q(parent)} in parents"
+            ),
+            "fields": "nextPageToken, files(id, name)",
+            "pageSize": 200,
+            "orderBy": "name_natural",
+        }
+        out: list[dict] = []
+        while True:
+            r = sess.get(f"{_API}/files", params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            out.extend({"id": f["id"], "name": f["name"]} for f in data.get("files", []))
+            token = data.get("nextPageToken")
+            if not token:
+                break
+            params["pageToken"] = token
+        return out
 
     # ---- listing ------------------------------------------------------
     def _resolve_folder_id(self, name_or_id: str) -> str:
@@ -130,22 +212,15 @@ class GoogleDriveSource(PhotoSource):
                 if not page:
                     break
 
-    # ---- bytes ------------------------------------------------------
-    def _session(self):
-        if self._authed_session is None:
-            from google.auth.transport.requests import AuthorizedSession
-
-            self._authed_session = AuthorizedSession(self._service()._http.credentials)
-        return self._authed_session
-
+    # ---- bytes (runs on the scan worker pool -- thread-local session only) ----
     def thumbnail(self, ref: PhotoRef, max_px: int = 256) -> bytes:
-        svc = self._service()
-        meta = svc.files().get(fileId=ref.id, fields="thumbnailLink").execute()
-        link = meta.get("thumbnailLink")
+        sess = self._session()
+        meta = sess.get(f"{_API}/files/{ref.id}", params={"fields": "thumbnailLink"}, timeout=30)
+        link = meta.json().get("thumbnailLink") if meta.ok else None
         if link:
             # thumbnailLink ends with '=s220'; swap the size we want
             link = link.rsplit("=s", 1)[0] + f"=s{max_px}"
-            r = self._session().get(link, timeout=30)
+            r = sess.get(link, timeout=30)
             if r.ok and r.content:
                 return r.content
         # fallback: download original, resize locally
@@ -159,16 +234,9 @@ class GoogleDriveSource(PhotoSource):
             return buf.getvalue()
 
     def full_bytes(self, ref: PhotoRef) -> bytes:
-        from googleapiclient.http import MediaIoBaseDownload
-
-        svc = self._service()
-        req = svc.files().get_media(fileId=ref.id)
-        buf = io.BytesIO()
-        dl = MediaIoBaseDownload(buf, req)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        return buf.getvalue()
+        r = self._session().get(f"{_API}/files/{ref.id}", params={"alt": "media"}, timeout=120)
+        r.raise_for_status()
+        return r.content
 
     # ---- quarantine ------------------------------------------------------
     def _review_folder(self) -> str:
@@ -199,6 +267,13 @@ class GoogleDriveSource(PhotoSource):
             fileId=ref.id, addParents=dest, removeParents=prev, fields="id, parents"
         ).execute()
         return f"Drive/{REVIEW_FOLDER_NAME}/{ref.name}"
+
+    def review_target(self) -> dict:
+        return {
+            "kind": "url",
+            "label": f"{REVIEW_FOLDER_NAME} (Google Drive)",
+            "value": f"https://drive.google.com/drive/folders/{self._review_folder()}",
+        }
 
 
 def _q(s: str) -> str:

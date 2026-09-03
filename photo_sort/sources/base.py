@@ -40,5 +40,12 @@ class PhotoSource(ABC):
         Never deletes. Returns a human-readable description of where it went.
         """
 
+    def review_target(self) -> dict | None:
+        """Where `quarantine` moves things, for the UI to link to after Apply.
+
+        ``{"kind": "url"|"path", "label": str, "value": str}`` or ``None``.
+        """
+        return None
+
     def close(self) -> None:  # optional cleanup hook
         pass

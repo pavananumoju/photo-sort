@@ -1,9 +1,5 @@
-# Which places to scan for photos. Add as many [[source]] blocks as you like.
+# photo-sort sources. Managed by the photo-sort web UI (Sources card).
 
 [[source]]
 type  = "gdrive"
-roots = ["Dandelli Trip"]          # Drive folder names (or folder ids)
-
-# [[source]]
-# type  = "local"                  # a pen drive, external HDD, or any folder
-# roots = ["/Volumes/MyPenDrive/DCIM"]
+roots = ["Cherry 2020"]
