@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from rich.console import Console
 from rich.progress import Progress
 from rich.table import Table
+
+# parallel thumbnail downloads during scan (network-bound, so > CPU count is fine)
+SCAN_WORKERS = 12
 
 from photo_sort.config import Config, build_source
 from photo_sort.grouping import group_photos
@@ -61,56 +66,70 @@ def run_scan(
         rp.start()
         task = rp.add_task("fingerprinting", total=total)
 
+    lock = threading.Lock()
+
+    def tick(msg: str) -> None:
+        nonlocal done
+        with lock:
+            done += 1
+            d = done
+        if rp:
+            rp.advance(task)
+        if progress_cb:
+            progress_cb(d, total, msg)
+
+    def fingerprint_one(source, ref) -> None:
+        """Download + analyse one uncached photo. Runs in a worker thread."""
+        key = photo_key(ref.source_id, ref.id)
+        cache_tag = f"{ref.size}:{int(ref.created.timestamp()) if ref.created else 0}"
+        if isinstance(source, LocalFolderSource) and not ref.checksum_md5:
+            ref = _with_md5(ref, LocalFolderSource.md5(ref.id))
+        try:
+            thumb = source.thumbnail(ref, max_px=thumb_px)
+        except Exception as e:  # noqa: BLE001 - one bad file shouldn't kill the run
+            if console:
+                console.print(f"    [yellow]skip[/] {ref.name}: {e}")
+            tick(f"skipped {ref.name}")
+            return
+        store.write_thumb(key, thumb)
+        facts = analyse_thumbnail(thumb, None, None)
+        sp = ScannedPhoto(
+            ref=ref, phash=facts.phash, dhash=facts.dhash,
+            width=facts.width, height=facts.height,
+            sharpness=facts.sharpness, brightness=facts.brightness,
+            flags=list(facts.flags), thumb_path=str(store.thumb_path_for(key)),
+        )
+        entry = {
+            "tag": cache_tag, "phash": facts.phash, "dhash": facts.dhash,
+            "sharpness": facts.sharpness, "brightness": facts.brightness,
+            "flags": [f.value for f in facts.flags], "md5": ref.checksum_md5,
+            "name": ref.name, "location": ref.location, "size": ref.size,
+            "source_id": ref.source_id, "id": ref.id,
+            "created": ref.created.isoformat() if ref.created else None,
+        }
+        with lock:
+            scanned.append(sp)
+            new_fp_cache[key] = entry
+        tick(ref.name)
+
     try:
         for source, refs in listed:
+            todo = []
             for ref in refs:
                 key = photo_key(ref.source_id, ref.id)
                 cache_tag = f"{ref.size}:{int(ref.created.timestamp()) if ref.created else 0}"
-
                 cached = fp_cache.get(key)
                 if cached and cached.get("tag") == cache_tag and not refresh:
                     scanned.append(_from_cache(ref, cached, store))
                     new_fp_cache[key] = cached
+                    tick(ref.name)
                 else:
-                    if isinstance(source, LocalFolderSource) and not ref.checksum_md5:
-                        ref = _with_md5(ref, LocalFolderSource.md5(ref.id))
-                    try:
-                        thumb = source.thumbnail(ref, max_px=thumb_px)
-                    except Exception as e:  # noqa: BLE001 - one bad file shouldn't kill the run
-                        if console:
-                            console.print(f"    [yellow]skip[/] {ref.name}: {e}")
-                        done += 1
-                        if rp:
-                            rp.advance(task)
-                        if progress_cb:
-                            progress_cb(done, total, f"skipped {ref.name}")
-                        continue
+                    todo.append(ref)
 
-                    store.write_thumb(key, thumb)
-                    facts = analyse_thumbnail(thumb, None, None)
-                    scanned.append(
-                        ScannedPhoto(
-                            ref=ref, phash=facts.phash, dhash=facts.dhash,
-                            width=facts.width, height=facts.height,
-                            sharpness=facts.sharpness, brightness=facts.brightness,
-                            flags=list(facts.flags),
-                            thumb_path=str(store.thumb_path_for(key)),
-                        )
-                    )
-                    new_fp_cache[key] = {
-                        "tag": cache_tag, "phash": facts.phash, "dhash": facts.dhash,
-                        "sharpness": facts.sharpness, "brightness": facts.brightness,
-                        "flags": [f.value for f in facts.flags], "md5": ref.checksum_md5,
-                        "name": ref.name, "location": ref.location, "size": ref.size,
-                        "source_id": ref.source_id, "id": ref.id,
-                        "created": ref.created.isoformat() if ref.created else None,
-                    }
-
-                done += 1
-                if rp:
-                    rp.advance(task)
-                if progress_cb:
-                    progress_cb(done, total, ref.name)
+            # download/analyse the uncached ones in parallel (network-bound)
+            if todo:
+                with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+                    list(pool.map(lambda r: fingerprint_one(source, r), todo))
             source.close()
     finally:
         if rp:
@@ -210,6 +229,72 @@ def run_apply(
             f"[bold green]Done.[/] {moved} photos moved. Review them, then delete for good yourself."
         )
     return {"moved": moved, "total": total}
+
+
+def regroup(state_dir: Path, similarity: int) -> dict:
+    """Re-run only the grouping step at a new strictness, straight from the
+    fingerprint cache. No source, no network, no thumbnails -- milliseconds.
+    """
+    store = Store(state_dir)
+    cache = store.load_fingerprints()
+    if not cache:
+        raise FileNotFoundError("No scan yet — run a scan first.")
+
+    scanned: list[ScannedPhoto] = []
+    for key, c in cache.items():
+        source_id, _, pid = key.partition("::")
+        ref = PhotoRef(
+            source_id=c.get("source_id", source_id),
+            id=c.get("id", pid),
+            name=c.get("name", pid),
+            location=c.get("location", ""),
+            size=int(c.get("size", 0)),
+            created=_parse_iso(c.get("created")),
+            checksum_md5=c.get("md5"),
+        )
+        scanned.append(
+            ScannedPhoto(
+                ref=ref,
+                phash=c.get("phash"),
+                dhash=c.get("dhash"),
+                sharpness=c.get("sharpness"),
+                brightness=c.get("brightness"),
+                flags=[_flag(x) for x in c.get("flags", [])],
+                thumb_path=str(store.thumb_path_for(key)),
+            )
+        )
+
+    groups = group_photos(scanned, phash_threshold=similarity)
+    payload = _scan_payload(scanned, groups)
+    store.save_scan(payload)
+
+    dup_count = sum(len(g["members"]) - 1 for g in payload["groups"])
+    reclaim = sum(m["size"] for g in payload["groups"] for m in g["members"][1:])
+    flagged = [s for s in payload["photos"] if s["flags"]]
+    return {
+        "photos": len(scanned),
+        "groups": len(groups),
+        "removable": dup_count,
+        "reclaim_bytes": reclaim,
+        "flagged": len(flagged),
+    }
+
+
+def _parse_iso(s: str | None):
+    if not s:
+        return None
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _flag(x: str):
+    from photo_sort.model import FlagReason
+
+    return FlagReason(x)
 
 
 def print_status(state_dir: Path, console: Console) -> None:

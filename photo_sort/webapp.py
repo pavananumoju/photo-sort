@@ -166,6 +166,22 @@ def serve(
         except FileNotFoundError:
             return JSONResponse({"ok": False, "groups": [], "photos": []})
 
+    @app.post("/api/regroup")
+    async def api_regroup(request: Request) -> JSONResponse:
+        """Re-group the existing scan at a new strictness. No network; instant."""
+        from photo_sort.pipeline import regroup
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            summary = regroup(state_dir, int(body.get("similarity", 12)))
+            return JSONResponse({"ok": True, "summary": summary})
+        except FileNotFoundError as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
     @app.get("/api/decisions")
     def api_get_decisions() -> JSONResponse:
         return JSONResponse(store.load_decisions())
@@ -238,7 +254,6 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>photo-sort</tit
      <option value=8>strict (copies only)</option>
      <option value=12 selected>normal</option>
      <option value=16>loose</option>
-     <option value=20>very loose</option>
     </select>
    </label>
    <label><input type=checkbox id=refresh> re-scan everything (ignore cache)</label>
@@ -260,6 +275,17 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>photo-sort</tit
 
  <div class=card>
   <h2>2 &middot; Review</h2>
+  <div class=stat style=margin-bottom:10px>
+   <label>match strictness
+    <select id=sim2>
+     <option value=8>strict (copies only)</option>
+     <option value=12 selected>normal</option>
+     <option value=16>loose</option>
+    </select>
+   </label>
+   <button id=regroupBtn disabled onclick=regroup()>Re-group at this strictness</button>
+   <span class=muted>instant — no re-scan</span>
+  </div>
   <button id=revBtn disabled onclick=loadReview()>Open review</button>
   <button id=saveBtn hidden onclick=saveDecisions()>Save decisions</button>
   <span id=revSummary class=muted></span>
@@ -332,7 +358,7 @@ async function tick(){
         const s=j.summary||{};
         $('#scanDone').hidden=false;
         $('#scanDone').innerHTML=`<b>${s.groups}</b> duplicate groups &middot; <b>${s.removable}</b> removable photos (~${Math.round((s.reclaim_bytes||0)/1048576)} MB) &middot; <b>${s.flagged}</b> flagged`;
-        $('#revBtn').disabled=false;
+        $('#revBtn').disabled=false; $('#regroupBtn').disabled=false;
       }
     }
     if(j.kind==='apply'){
@@ -341,6 +367,22 @@ async function tick(){
       else { $('#applyDone').hidden=false; $('#applyDone').innerHTML=`<b>${(j.summary||{}).moved||0}</b> photos moved. Check the review folder, then delete for good yourself.`; }
     }
   }
+}
+
+async function regroup(){
+  const btn=$('#regroupBtn'); btn.disabled=true; btn.textContent='re-grouping…';
+  const r=await fetch('/api/regroup',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({similarity:+$('#sim2').value})});
+  const j=await r.json();
+  btn.disabled=false; btn.textContent='Re-group at this strictness';
+  if(!j.ok){ alert(j.error||'re-group failed'); return; }
+  const s=j.summary||{};
+  $('#scanDone').hidden=false;
+  $('#scanDone').innerHTML=`<b>${s.groups}</b> duplicate groups &middot; <b>${s.removable}</b> removable photos (~${Math.round((s.reclaim_bytes||0)/1048576)} MB) &middot; <b>${s.flagged}</b> flagged`;
+  // grouping changed -> clear old picks so nothing stale gets moved
+  await fetch('/api/decisions',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+  decisions={}; $('#applyBtn').disabled=true;
+  await loadReview();
 }
 
 async function loadReview(){
@@ -392,5 +434,5 @@ async function saveDecisions(){
 
 loadConfig();
 // if a scan already exists from a previous run, let the user jump straight to review
-fetch('/api/progress').then(r=>r.json()).then(j=>{ if(j.has_scan){ $('#revBtn').disabled=false; } if(j.state==='running'){ $('#scanProg').hidden=false; $('#scanBtn').disabled=true; startPolling(); } });
+fetch('/api/progress').then(r=>r.json()).then(j=>{ if(j.has_scan){ $('#revBtn').disabled=false; $('#regroupBtn').disabled=false; } if(j.state==='running'){ $('#scanProg').hidden=false; $('#scanBtn').disabled=true; startPolling(); } });
 </script></body></html>"""
