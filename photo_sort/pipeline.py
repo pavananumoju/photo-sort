@@ -24,9 +24,15 @@ FLAG_LABELS = {
 
 
 def run_scan(
-    config_path: str, thumb_px: int, refresh: bool, state_dir: Path, console: Console,
-    similarity: int = 12,
-) -> None:
+    config_path: str, thumb_px: int, refresh: bool, state_dir: Path,
+    console: Console | None = None, similarity: int = 12,
+    progress_cb: "Callable[[int, int, str], None] | None" = None,
+) -> dict:
+    """Fingerprint + group every photo. Returns a summary dict.
+
+    `console` (CLI) drives a rich progress bar; `progress_cb` (web UI) is called
+    as ``cb(done, total, message)`` after every photo. Either, both, or neither.
+    """
     cfg = Config.load(config_path)
     store = Store(state_dir)
     fp_cache: dict = {} if refresh else store.load_fingerprints()
@@ -34,14 +40,29 @@ def run_scan(
     scanned: list[ScannedPhoto] = []
     new_fp_cache: dict = {}
 
+    # list every source up front so the total (and ETA) is known from photo #1
+    listed: list[tuple] = []
     for spec in cfg.sources:
         source = build_source(spec)
-        console.print(f"[bold]Source[/] {spec.type} :: {', '.join(spec.roots)}")
+        if console:
+            console.print(f"[bold]Source[/] {spec.type} :: {', '.join(spec.roots)}")
         refs = list(source.list_photos(spec.roots))
-        console.print(f"  {len(refs)} photos")
+        if console:
+            console.print(f"  {len(refs)} photos")
+        listed.append((source, refs))
+    total = sum(len(r) for _, r in listed)
+    if progress_cb:
+        progress_cb(0, total, "listing complete")
 
-        with Progress(console=console) as progress:
-            task = progress.add_task("  fingerprinting", total=len(refs))
+    done = 0
+    rp = task = None
+    if console:
+        rp = Progress(console=console)
+        rp.start()
+        task = rp.add_task("fingerprinting", total=total)
+
+    try:
+        for source, refs in listed:
             for ref in refs:
                 key = photo_key(ref.source_id, ref.id)
                 cache_tag = f"{ref.size}:{int(ref.created.timestamp()) if ref.created else 0}"
@@ -50,51 +71,50 @@ def run_scan(
                 if cached and cached.get("tag") == cache_tag and not refresh:
                     scanned.append(_from_cache(ref, cached, store))
                     new_fp_cache[key] = cached
-                    progress.advance(task)
-                    continue
+                else:
+                    if isinstance(source, LocalFolderSource) and not ref.checksum_md5:
+                        ref = _with_md5(ref, LocalFolderSource.md5(ref.id))
+                    try:
+                        thumb = source.thumbnail(ref, max_px=thumb_px)
+                    except Exception as e:  # noqa: BLE001 - one bad file shouldn't kill the run
+                        if console:
+                            console.print(f"    [yellow]skip[/] {ref.name}: {e}")
+                        done += 1
+                        if rp:
+                            rp.advance(task)
+                        if progress_cb:
+                            progress_cb(done, total, f"skipped {ref.name}")
+                        continue
 
-                # local files: fill md5 now so exact-dup detection works
-                if isinstance(source, LocalFolderSource) and not ref.checksum_md5:
-                    ref = _with_md5(ref, LocalFolderSource.md5(ref.id))
+                    store.write_thumb(key, thumb)
+                    facts = analyse_thumbnail(thumb, None, None)
+                    scanned.append(
+                        ScannedPhoto(
+                            ref=ref, phash=facts.phash, dhash=facts.dhash,
+                            width=facts.width, height=facts.height,
+                            sharpness=facts.sharpness, brightness=facts.brightness,
+                            flags=list(facts.flags),
+                            thumb_path=str(store.thumb_path_for(key)),
+                        )
+                    )
+                    new_fp_cache[key] = {
+                        "tag": cache_tag, "phash": facts.phash, "dhash": facts.dhash,
+                        "sharpness": facts.sharpness, "brightness": facts.brightness,
+                        "flags": [f.value for f in facts.flags], "md5": ref.checksum_md5,
+                        "name": ref.name, "location": ref.location, "size": ref.size,
+                        "source_id": ref.source_id, "id": ref.id,
+                        "created": ref.created.isoformat() if ref.created else None,
+                    }
 
-                try:
-                    thumb = source.thumbnail(ref, max_px=thumb_px)
-                except Exception as e:  # noqa: BLE001 - one bad file shouldn't kill the run
-                    console.print(f"    [yellow]skip[/] {ref.name}: {e}")
-                    progress.advance(task)
-                    continue
-
-                store.write_thumb(key, thumb)
-                facts = analyse_thumbnail(thumb, ref.width if hasattr(ref, "width") else None, None)
-                sp = ScannedPhoto(
-                    ref=ref,
-                    phash=facts.phash,
-                    dhash=facts.dhash,
-                    width=facts.width,
-                    height=facts.height,
-                    sharpness=facts.sharpness,
-                    brightness=facts.brightness,
-                    flags=list(facts.flags),
-                    thumb_path=str(store.thumb_path_for(key)),
-                )
-                scanned.append(sp)
-                new_fp_cache[key] = {
-                    "tag": cache_tag,
-                    "phash": facts.phash,
-                    "dhash": facts.dhash,
-                    "sharpness": facts.sharpness,
-                    "brightness": facts.brightness,
-                    "flags": [f.value for f in facts.flags],
-                    "md5": ref.checksum_md5,
-                    "name": ref.name,
-                    "location": ref.location,
-                    "size": ref.size,
-                    "source_id": ref.source_id,
-                    "id": ref.id,
-                    "created": ref.created.isoformat() if ref.created else None,
-                }
-                progress.advance(task)
-        source.close()
+                done += 1
+                if rp:
+                    rp.advance(task)
+                if progress_cb:
+                    progress_cb(done, total, ref.name)
+            source.close()
+    finally:
+        if rp:
+            rp.stop()
 
     store.save_fingerprints(new_fp_cache)
 
@@ -103,61 +123,76 @@ def run_scan(
     store.save_scan(payload)
 
     dup_count = sum(len(g["members"]) - 1 for g in payload["groups"])
-    reclaim = sum(
-        m["size"] for g in payload["groups"] for m in g["members"][1:]
-    )
+    reclaim = sum(m["size"] for g in payload["groups"] for m in g["members"][1:])
     flagged = [s for s in payload["photos"] if s["flags"]]
-    console.print()
-    console.print(
-        f"[bold green]{len(groups)}[/] duplicate groups covering "
-        f"[bold]{dup_count}[/] removable photos (~{_mb(reclaim)} MB)."
-    )
-    console.print(f"[bold yellow]{len(flagged)}[/] photos flagged (blurry / dark / blown out).")
-    console.print("Next: [bold]photo-sort review[/]")
+    summary = {
+        "photos": len(scanned),
+        "groups": len(groups),
+        "removable": dup_count,
+        "reclaim_bytes": reclaim,
+        "flagged": len(flagged),
+    }
+    if console:
+        console.print()
+        console.print(
+            f"[bold green]{len(groups)}[/] duplicate groups covering "
+            f"[bold]{dup_count}[/] removable photos (~{_mb(reclaim)} MB)."
+        )
+        console.print(f"[bold yellow]{len(flagged)}[/] photos flagged (blurry / dark / blown out).")
+        console.print("Next: [bold]photo-sort review[/]")
+    return summary
 
 
-def run_apply(state_dir: Path, assume_yes: bool, console: Console) -> None:
+def run_apply(
+    state_dir: Path, assume_yes: bool = True, console: Console | None = None,
+    config_path: str = "photo-sort.toml",
+    progress_cb: "Callable[[int, int, str], None] | None" = None,
+) -> dict:
+    """Move every photo marked 'quarantine' into its source's review area. Never deletes."""
     store = Store(state_dir)
     scan = store.load_scan()
     decisions = store.load_decisions()
-    if not decisions:
-        console.print("No decisions found. Run [bold]photo-sort review[/] and mark photos first.")
-        raise SystemExit(1)
-
     to_move = [k for k, v in decisions.items() if v == "quarantine"]
     if not to_move:
-        console.print("Nothing marked for removal.")
-        return
+        if console:
+            console.print("Nothing marked for removal.")
+        return {"moved": 0, "total": 0}
 
-    console.print(f"About to move [bold]{len(to_move)}[/] photos into each source's review area.")
-    console.print("Originals are only [i]moved[/], never deleted.")
-    if not assume_yes:
-        typer_confirm(console)
+    if console:
+        console.print(f"About to move [bold]{len(to_move)}[/] photos into each source's review area.")
+        console.print("Originals are only [i]moved[/], never deleted.")
+        if not assume_yes:
+            typer_confirm(console)
 
-    by_source = {}
-    for p in scan["photos"]:
-        by_source.setdefault(p["source_id"], {})[photo_key(p["source_id"], p["id"])] = p
+    by_id = {photo_key(p["source_id"], p["id"]): p for p in scan["photos"]}
 
-    # rebuild the right source object per source_id
-    cfg = Config.load("photo-sort.toml")
-    source_objs = {}
+    # rebuild one live source object per source_id
+    cfg = Config.load(config_path)
+    source_objs: dict = {}
     for spec in cfg.sources:
         s = build_source(spec)
-        # list once to bind source_id(s); cheap compared to the move itself
+        bound = False
         for ref in s.list_photos(spec.roots):
             source_objs[ref.source_id] = s
+            bound = True
             break
-        else:
+        if not bound:
             source_objs[spec.type] = s
 
+    total = len(to_move)
     moved = 0
-    for key in to_move:
-        p = next((pp for pp in scan["photos"] if photo_key(pp["source_id"], pp["id"]) == key), None)
+    for i, key in enumerate(to_move, 1):
+        p = by_id.get(key)
         if not p:
+            if progress_cb:
+                progress_cb(i, total, "missing from scan")
             continue
         s = source_objs.get(p["source_id"])
         if not s:
-            console.print(f"[yellow]no live source for[/] {p['name']}")
+            if console:
+                console.print(f"[yellow]no live source for[/] {p['name']}")
+            if progress_cb:
+                progress_cb(i, total, f"no source for {p['name']}")
             continue
         ref = PhotoRef(
             source_id=p["source_id"], id=p["id"], name=p["name"],
@@ -165,8 +200,16 @@ def run_apply(state_dir: Path, assume_yes: bool, console: Console) -> None:
         )
         where = s.quarantine(ref)
         moved += 1
-        console.print(f"  moved {p['name']} -> {where}")
-    console.print(f"[bold green]Done.[/] {moved} photos moved. Review them, then delete for good yourself.")
+        if console:
+            console.print(f"  moved {p['name']} -> {where}")
+        if progress_cb:
+            progress_cb(i, total, f"moved {p['name']}")
+
+    if console:
+        console.print(
+            f"[bold green]Done.[/] {moved} photos moved. Review them, then delete for good yourself."
+        )
+    return {"moved": moved, "total": total}
 
 
 def print_status(state_dir: Path, console: Console) -> None:

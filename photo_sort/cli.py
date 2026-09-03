@@ -1,11 +1,13 @@
 """Command-line entry point.
 
-    photo-sort scan     # look at every configured source, group duplicates, flag bad shots
-    photo-sort review   # open a local web page to pick what to remove
-    photo-sort apply    # act on those picks (move to each source's review area)
-    photo-sort status   # what the last scan found
+    photo-sort ui       # everything in one local web page: scan, review, apply (recommended)
 
-State for a run lives in ./.photo-sort/ (thumbnails + a small SQLite index).
+    photo-sort scan     # terminal: group duplicates, flag bad shots
+    photo-sort review   # terminal-launched web page for the last scan
+    photo-sort apply    # terminal: move ticked photos to each source's review area
+    photo-sort status   # terminal: summarise the last scan
+
+Run state lives in ./.photo-sort/ (thumbnail cache + small JSON index).
 """
 
 from __future__ import annotations
@@ -19,6 +21,22 @@ app = typer.Typer(add_completion=False, help=__doc__)
 console = Console()
 
 STATE_DIR = Path(".photo-sort")
+
+
+@app.command()
+def ui(
+    config: str = typer.Option("photo-sort.toml", "--config", "-c"),
+    host: str = typer.Option("127.0.0.1"),
+    port: int = typer.Option(8000),
+    no_open: bool = typer.Option(False, "--no-open", help="don't auto-open the browser"),
+) -> None:
+    """Open the all-in-one local web page (scan with live progress, review, apply)."""
+    from photo_sort.webapp import serve
+
+    serve(
+        state_dir=STATE_DIR, host=host, port=port, config_path=config,
+        console=console, open_browser=not no_open,
+    )
 
 
 @app.command()
@@ -42,23 +60,25 @@ def scan(
 
 @app.command()
 def review(
+    config: str = typer.Option("photo-sort.toml", "--config", "-c"),
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8000),
 ) -> None:
-    """Open the local review page for the most recent scan."""
-    from photo_sort.review_server import serve
+    """Open the local review/scan page (same page as `ui`)."""
+    from photo_sort.webapp import serve
 
-    serve(state_dir=STATE_DIR, host=host, port=port, console=console)
+    serve(state_dir=STATE_DIR, host=host, port=port, config_path=config, console=console)
 
 
 @app.command()
 def apply(
+    config: str = typer.Option("photo-sort.toml", "--config", "-c"),
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt"),
 ) -> None:
     """Move every photo marked 'remove' in review into its source's review area. Never deletes."""
     from photo_sort.pipeline import run_apply
 
-    run_apply(state_dir=STATE_DIR, assume_yes=yes, console=console)
+    run_apply(state_dir=STATE_DIR, assume_yes=yes, console=console, config_path=config)
 
 
 @app.command()

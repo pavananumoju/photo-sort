@@ -14,12 +14,24 @@ touched only when you approve a move.
 
 ## How it works
 
-| Stage | Command | What happens |
-|---|---|---|
-| Scan | `photo-sort scan` | list photos → download thumbnails → fingerprint (perceptual hash) → group duplicates → flag blurry/dark/blown-out shots |
-| Review | `photo-sort review` | opens `localhost:8000`; each group shows keeper + duplicates, tick what to remove |
-| Apply | `photo-sort apply` | moves ticked photos into each source's review area (Drive: a `photo-sort review` folder; local: `_photo-sort-review/`) |
-| Status | `photo-sort status` | summary of the last scan |
+Run one command:
+
+```bash
+photo-sort ui
+```
+
+It opens a local web page (`localhost:8000`) with three steps:
+
+1. **Scan** — list photos → download thumbnails → fingerprint (perceptual hash) →
+   group duplicates → flag blurry/dark/blown-out shots. Live progress: count, %,
+   elapsed, ETA.
+2. **Review** — each group shows the suggested keeper + its duplicates; tick what
+   to remove. Save.
+3. **Apply** — moves ticked photos into each source's review area (Drive: a
+   `photo-sort review` folder; local: `_photo-sort-review/`). Never deletes.
+
+The same steps exist as terminal commands if you prefer: `photo-sort scan`,
+`photo-sort review`, `photo-sort apply`, `photo-sort status`.
 
 Run state lives in `./.photo-sort/` (thumbnail cache + small JSON index). Safe to
 delete. A second `scan` reuses fingerprints and only looks at new/changed photos.
