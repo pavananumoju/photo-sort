@@ -1,0 +1,21 @@
+# photo-sort local state
+.photo-sort/
+*.sqlite
+*.sqlite3
+
+# secrets
+client_secret*.json
+token.json
+credentials.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# os
+.DS_Store

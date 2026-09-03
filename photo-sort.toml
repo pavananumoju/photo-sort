@@ -1,0 +1,9 @@
+# Which places to scan for photos. Add as many [[source]] blocks as you like.
+
+[[source]]
+type  = "gdrive"
+roots = ["Dandelli Trip"]          # Drive folder names (or folder ids)
+
+# [[source]]
+# type  = "local"                  # a pen drive, external HDD, or any folder
+# roots = ["/Volumes/MyPenDrive/DCIM"]
