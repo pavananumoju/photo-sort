@@ -13,6 +13,9 @@ import traceback
 import webbrowser
 from pathlib import Path
 
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from rich.console import Console
 
 # ---- background job state -------------------------------------------------
@@ -98,10 +101,6 @@ def serve(
     config_path: str = "photo-sort.toml", console: Console | None = None,
     open_browser: bool = True,
 ) -> None:
-    import uvicorn
-    from fastapi import FastAPI, Request
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-
     from photo_sort.config import Config
     from photo_sort.store import Store, photo_key
 
