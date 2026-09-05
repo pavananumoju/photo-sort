@@ -63,8 +63,12 @@ class LocalFolderSource(PhotoSource):
     def quarantine(self, ref: PhotoRef) -> str:
         src = Path(ref.id)
         # put the review dir at the mount/drive root when we can identify it, else next to the file
-        anchors = [p for p in src.parents if p.name == "" or str(p).count("/") <= 2]
-        drive_root = Path("/Volumes") / src.parts[2] if src.parts[:2] == ("/", "Volumes") else src.parent
+        if src.parts[:2] == ("/", "Volumes") and len(src.parts) > 2:
+            drive_root = Path("/Volumes") / src.parts[2]  # macOS: a mounted volume
+        elif src.drive:
+            drive_root = Path(src.anchor)  # Windows: the drive letter, e.g. "D:\\"
+        else:
+            drive_root = src.parent
         dest_dir = drive_root / REVIEW_DIRNAME
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / src.name

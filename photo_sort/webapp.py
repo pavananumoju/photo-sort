@@ -7,6 +7,7 @@ polls ``/api/progress`` once a second.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -209,14 +210,22 @@ def serve(
                 except OSError:
                     pass
             shortcuts = [{"name": "Home", "path": str(Path.home())}]
-            vol = Path("/Volumes")
-            if vol.is_dir():
-                for d in sorted(vol.iterdir(), key=lambda p: p.name.lower()):
-                    try:
-                        if d.is_dir():
-                            shortcuts.append({"name": f"/Volumes/{d.name}", "path": str(d)})
-                    except OSError:
-                        pass
+            if os.name == "nt":
+                import string
+
+                for letter in string.ascii_uppercase:
+                    d = Path(f"{letter}:\\")
+                    if d.is_dir():
+                        shortcuts.append({"name": f"{letter}:\\", "path": str(d)})
+            else:
+                vol = Path("/Volumes")
+                if vol.is_dir():
+                    for d in sorted(vol.iterdir(), key=lambda p: p.name.lower()):
+                        try:
+                            if d.is_dir():
+                                shortcuts.append({"name": f"/Volumes/{d.name}", "path": str(d)})
+                        except OSError:
+                            pass
             return JSONResponse(
                 {
                     "ok": True,
@@ -452,6 +461,10 @@ PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>photo-sort</tit
    <input id=brManual placeholder="…or paste a Drive folder name / ID" style="flex:1;padding:6px;font:inherit">
    <button id=brManualAdd>Add</button>
   </div>
+  <div id=brManualLocalRow style="display:flex;gap:6px;margin:10px 0">
+   <input id=brManualLocal placeholder="…or paste a folder path (e.g. D:\Photos)" style="flex:1;padding:6px;font:inherit">
+   <button id=brManualLocalAdd>Add</button>
+  </div>
   <div class=actions>
    <button id=brCancel>Cancel</button>
    <button class=primary id=brAdd>Add this folder</button>
@@ -552,6 +565,11 @@ $('#brManualAdd').onclick = () => {
   if(!v) return;
   addRoot('gdrive', v); $('#brManual').value = ''; $('#browser').hidden = true;
 };
+$('#brManualLocalAdd').onclick = () => {
+  const v = $('#brManualLocal').value.trim();
+  if(!v) return;
+  addRoot('local', v); $('#brManualLocal').value = ''; $('#browser').hidden = true;
+};
 $('#brAdd').onclick = () => {
   if(brMode === 'gdrive'){
     const cur = brStack[brStack.length-1];
@@ -569,6 +587,7 @@ async function openGdrive(){
   brStack = [{id:'root', name:'My Drive'}];
   $('#brTitle').textContent = 'Choose a Google Drive folder';
   $('#brManualRow').style.display = '';
+  $('#brManualLocalRow').style.display = 'none';
   $('#browser').hidden = false;
   const st = await (await fetch('/api/gdrive/status')).json();
   if(!st.authed){
@@ -613,6 +632,7 @@ async function openLocal(){
   brMode = 'local';
   $('#brTitle').textContent = 'Choose a local / external-drive folder';
   $('#brManualRow').style.display = 'none';
+  $('#brManualLocalRow').style.display = '';
   $('#browser').hidden = false;
   brLoadLocal('');
 }
