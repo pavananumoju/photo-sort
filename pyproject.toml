@@ -7,6 +7,7 @@ dependencies = [
     "Pillow>=10.0",          # open/resize images, read EXIF
     "ImageHash>=4.3",        # perceptual hashes (pHash / dHash)
     "numpy>=1.26",           # hash math, clustering
+    "scikit-image>=0.22",    # SSIM: confirms phash candidates are really the same shot
     "typer>=0.12",           # CLI
     "rich>=13.0",            # progress bars / tables in the terminal
     "platformdirs>=4.0",     # per-user cache/config locations
